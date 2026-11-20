@@ -456,4 +456,10 @@ const server = createServer((request, response) => {
 })
 
 const port = Number(process.env.PORT) || 4000
-server.listen(port, () => console.log(`PrimeVest API listening on http://localhost:${port}`))
+databaseReady.then(() => {
+  server.listen(port, () => console.log(`PrimeVest API listening on http://localhost:${port}`))
+}).catch(error => {
+  console.error('MongoDB startup connection failed. Check MONGODB_URI and Atlas network access before retrying.')
+  console.error(error)
+  process.exitCode = 1
+})
