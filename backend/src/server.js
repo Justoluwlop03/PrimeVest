@@ -330,6 +330,31 @@ async function route(request, response) {
         depositAddresses: sharedDepositAddresses,
       })
     }
+    if (method === 'POST' && url.pathname === '/api/admin/alerts') {
+      const body = await readJson(request)
+      const title = typeof body.title === 'string' ? body.title.trim() : ''
+      const message = typeof body.message === 'string' ? body.message.replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim() : ''
+      if (!title || title.length > 120 || !message || message.length > 1000) return send(response, 400, { error: 'Provide a title (up to 120 characters) and message (up to 1000 characters).' })
+      const targets = database.users.filter(account => account.role !== 'admin')
+      const createdAt = new Date().toISOString()
+      const deliveries = targets.map(target => ({
+        target,
+        alert: { id: randomUUID(), title, message, createdAt, read: false },
+      }))
+      if (deliveries.length) {
+        await usersCollection.bulkWrite(deliveries.map(({ target, alert }) => ({
+          updateOne: {
+            filter: { id: target.id, role: { $ne: 'admin' } },
+            update: { $push: { alerts: { $each: [alert], $position: 0 } } },
+          },
+        })))
+        for (const { target, alert } of deliveries) {
+          target.alerts ||= []
+          target.alerts.unshift(alert)
+        }
+      }
+      return send(response, 201, { sent: deliveries.length })
+    }
     if (method === 'GET' && url.pathname === '/api/admin/alerts') {
       const alerts = database.users.filter(account => account.role !== 'admin').flatMap(account =>
         (account.alerts || []).map(alert => ({ ...alert, userId: account.id, userName: account.name, userEmail: account.email }))

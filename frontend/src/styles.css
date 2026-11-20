@@ -384,6 +384,7 @@ a { color: inherit; }
 
 /* Admin */
 .admin-page > .page-title-row { margin-bottom: 21px; }
+.admin-page-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .admin-stats { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-bottom: 14px; }
 .admin-stat { padding: 15px 17px; display: flex; flex-direction: column; align-items: flex-start; }
 .admin-stat > span { color: var(--muted); font-size: 9px; letter-spacing: .7px; font-weight: 600; }
@@ -583,6 +584,7 @@ a { color: inherit; }
   .activity-table th, .activity-table td { padding-left: 11px; padding-right: 11px; }
   .admin-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .admin-page > .page-title-row { gap: 8px; }
+  .admin-page-actions { width: 100%; justify-content: flex-start; }
   .address-grid { grid-template-columns: 1fr; }
   .simulator-controls { grid-template-columns: 1fr; }
   .simulator-result { grid-template-columns: 1fr; }

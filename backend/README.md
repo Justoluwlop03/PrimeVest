@@ -51,6 +51,7 @@ All request and response bodies use JSON. Authenticated routes require `Authoriz
 | GET | `/api/admin/users` | List non-admin accounts (admin role required) |
 | GET, PATCH | `/api/admin/deposit-addresses` | Read or set shared funding addresses for all users (admin role required) |
 | GET | `/api/admin/alerts` | List sent alerts with recipient details (admin role required) |
+| POST | `/api/admin/alerts` | Send a persisted alert to all non-admin accounts (admin role required) |
 | GET | `/api/admin/activity` | List activity across non-admin accounts (admin role required) |
 | POST | `/api/admin/users/:id/alerts` | Send a persisted alert to a user (admin role required) |
 | GET | `/api/alerts` | List alerts for the signed-in user |
