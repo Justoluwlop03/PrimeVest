@@ -1,0 +1,459 @@
+import { createServer } from 'node:http'
+import { createHmac, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto'
+import { promisify } from 'node:util'
+import { MongoClient } from 'mongodb'
+
+const mongoUri = process.env.MONGODB_URI?.trim()
+if (!mongoUri) throw new Error('MONGODB_URI is not configured. Set it in backend/.env to a MongoDB connection string.')
+if (!/^mongodb(?:\+srv)?:\/\//i.test(mongoUri)) throw new Error('MONGODB_URI must start with mongodb:// or mongodb+srv://.')
+
+const scrypt = promisify(scryptCallback)
+const mongoClient = new MongoClient(mongoUri)
+let usersCollection
+let settingsCollection
+let sharedDepositAddresses = {}
+const allowedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:5173'
+const revokedTokens = new Set()
+const jwtSecret = process.env.JWT_SECRET
+const jwtExpiresIn = process.env.JWT_EXPIRES_IN || '180d'
+const sessionLifetimeSeconds = parseDurationSeconds(jwtExpiresIn)
+if (!jwtSecret) throw new Error('JWT_SECRET must be set to sign authentication tokens.')
+if (!sessionLifetimeSeconds) throw new Error('JWT_EXPIRES_IN must be a positive duration such as 180d, 12h, or 30m.')
+const maxBodyBytes = 1024 * 1024
+let pendingWrite = Promise.resolve()
+const depositNetworks = {
+  BTC: ['Bitcoin'],
+  ETH: ['Ethereum (ERC-20)'],
+  USDT: ['TRON (TRC-20)', 'Ethereum (ERC-20)', 'BNB Smart Chain (BEP-20)'],
+  SOL: ['Solana'],
+}
+const investmentPeriodMs = 5 * 24 * 60 * 60 * 1000
+const investmentLockMs = 30 * 24 * 60 * 60 * 1000
+const simulatedRatePerPeriod = 0.08
+
+function investmentSnapshot(investment, now = Date.now()) {
+  const startedAt = Date.parse(investment.createdAt)
+  const maturityTime = startedAt + investmentLockMs
+  const valueTime = investment.status === 'closed' ? Date.parse(investment.closedAt) : now
+  const completedPeriods = investment.status === 'closed'
+    ? Number(investment.completedPeriods) || 0
+    : Math.max(0, Math.floor((valueTime - startedAt) / investmentPeriodMs))
+  const calculatedValue = Math.round(investment.principal * Math.pow(1 + simulatedRatePerPeriod, completedPeriods) * 1e8) / 1e8
+  const currentValue = investment.status === 'closed' ? Number(investment.returnedAmount) : calculatedValue
+  return {
+    ...investment,
+    ratePerPeriod: simulatedRatePerPeriod,
+    periodDays: 5,
+    lockDays: 30,
+    completedPeriods,
+    currentValue,
+    profitAmount: Math.round((currentValue - investment.principal) * 1e8) / 1e8,
+    maturesAt: new Date(maturityTime).toISOString(),
+    canRedeem: investment.status === 'active' && now >= maturityTime,
+  }
+}
+
+async function loadDatabase() {
+  await mongoClient.connect()
+  const databaseName = new URL(mongoUri).pathname.slice(1) || 'bluevault'
+  const mongoDatabase = mongoClient.db(databaseName)
+  usersCollection = mongoDatabase.collection('users')
+  settingsCollection = mongoDatabase.collection('settings')
+  await usersCollection.createIndex({ email: 1 }, { unique: true })
+  const [users, addressSettings] = await Promise.all([
+    usersCollection.find({}, { projection: { _id: 0 } }).sort({ id: 1 }).toArray(),
+    settingsCollection.findOne({ _id: 'shared-deposit-addresses' }),
+  ])
+  return { version: 1, users, sharedDepositAddresses: addressSettings?.value || {} }
+}
+
+let database
+
+async function seedConfiguredAdmin() {
+  const email = process.env.ADMIN_EMAIL?.trim().toLowerCase()
+  const password = process.env.ADMIN_PASSWORD
+  const name = process.env.ADMIN_NAME?.trim() || 'PrimeVest Admin'
+  if (!email && !password) return
+  if (!validEmail(email) || typeof password !== 'string' || password.length < 12 || password.length > 128) {
+    throw new Error('Set a valid ADMIN_EMAIL and an ADMIN_PASSWORD between 12 and 128 characters.')
+  }
+  const existing = database.users.find(user => user.email === email)
+  if (existing && existing.role !== 'admin') throw new Error('ADMIN_EMAIL is already registered as a non-admin account.')
+  const passwordSalt = randomBytes(16).toString('hex')
+  const passwordHash = (await scrypt(password, passwordSalt, 64)).toString('hex')
+  if (existing) {
+    existing.name = name
+    existing.passwordSalt = passwordSalt
+    existing.passwordHash = passwordHash
+  } else {
+    database.users.push({ id: randomUUID(), name, email, role: 'admin', status: 'approved', balances: {}, transactions: [], createdAt: new Date().toISOString(), passwordSalt, passwordHash })
+  }
+  await persistDatabase(database)
+  console.log(`Configured administrator account: ${email}`)
+}
+
+let databaseReady = loadDatabase().then(async data => {
+  database = data
+  sharedDepositAddresses = data.sharedDepositAddresses
+  await seedConfiguredAdmin()
+})
+
+function persistDatabase(data) {
+  pendingWrite = pendingWrite.then(async () => {
+    const ids = data.users.map(user => user.id)
+    await usersCollection.deleteMany(ids.length ? { id: { $nin: ids } } : {})
+    if (data.users.length) await usersCollection.bulkWrite(data.users.map(user => ({
+      replaceOne: { filter: { id: user.id }, replacement: user, upsert: true }
+    })))
+  })
+  return pendingWrite
+}
+
+function send(response, status, payload) {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+  response.end(JSON.stringify(payload))
+}
+
+async function readJson(request) {
+  let size = 0
+  const chunks = []
+  for await (const chunk of request) {
+    size += chunk.length
+    if (size > maxBodyBytes) throw Object.assign(new Error('Request body too large.'), { status: 413 })
+    chunks.push(chunk)
+  }
+  if (size === 0) return {}
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
+  catch { throw Object.assign(new Error('Request body must be valid JSON.'), { status: 400 }) }
+}
+
+function publicUser(user) {
+  const { passwordHash, passwordSalt, ...safe } = user
+  if (user.role !== 'admin') {
+    safe.depositAddresses = { ...(safe.depositAddresses || {}), ...sharedDepositAddresses }
+  }
+  return safe
+}
+
+function parseDurationSeconds(value) {
+  const match = typeof value === 'string' && value.match(/^(\d+)(s|m|h|d)$/)
+  if (!match || Number(match[1]) < 1) return 0
+  return Number(match[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 }[match[2]])
+}
+
+function signJwt(user) {
+  const now = Math.floor(Date.now() / 1000)
+  const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')
+  const unsigned = `${encode({ alg: 'HS256', typ: 'JWT' })}.${encode({ sub: user.id, iat: now, exp: now + sessionLifetimeSeconds })}`
+  const signature = createHmac('sha256', jwtSecret).update(unsigned).digest('base64url')
+  return `${unsigned}.${signature}`
+}
+
+function authenticate(request) {
+  const token = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]
+  if (!token || revokedTokens.has(token)) return null
+  const parts = token.split('.')
+  if (parts.length !== 3) return null
+  const unsigned = `${parts[0]}.${parts[1]}`
+  const expected = createHmac('sha256', jwtSecret).update(unsigned).digest()
+  let header, payload, actual
+  try {
+    header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
+    actual = Buffer.from(parts[2], 'base64url')
+  } catch { return null }
+  if (header.alg !== 'HS256' || actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null
+  const now = Math.floor(Date.now() / 1000)
+  if (typeof payload.sub !== 'string' || !Number.isFinite(payload.exp) || payload.exp <= now) return null
+  return payload.sub
+}
+
+function validEmail(email) { return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) }
+
+function validateDepositAddresses(addresses) {
+  if (!addresses || typeof addresses !== 'object' || Array.isArray(addresses)) return 'Deposit addresses must be an asset-keyed object.'
+  for (const [ticker, wallet] of Object.entries(addresses)) {
+    if (!Object.hasOwn(depositNetworks, ticker) || !wallet || typeof wallet !== 'object' || Array.isArray(wallet)) return 'Deposit addresses contain an unsupported asset.'
+    if (Object.keys(wallet).some(field => !['address', 'network'].includes(field)) || typeof wallet.address !== 'string' || wallet.address.length > 500 || !depositNetworks[ticker].includes(wallet.network)) {
+      return `Provide a valid ${ticker} address and network.`
+    }
+  }
+  return null
+}
+
+async function route(request, response) {
+  await databaseReady
+  const url = new URL(request.url, 'http://localhost')
+  const method = request.method
+  if (method === 'GET' && url.pathname === '/health') return send(response, 200, { status: 'ok' })
+
+  if (method === 'POST' && url.pathname === '/api/auth/register') {
+    const body = await readJson(request)
+    const name = typeof body.name === 'string' ? body.name.trim() : ''
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+    if (name.length < 1 || name.length > 100) return send(response, 400, { error: 'Name must be between 1 and 100 characters.' })
+    if (!validEmail(email) || email.length > 254) return send(response, 400, { error: 'Enter a valid email address.' })
+    if (typeof body.password !== 'string' || body.password.length < 8 || body.password.length > 128) return send(response, 400, { error: 'Password must be between 8 and 128 characters.' })
+    if (database.users.some(user => user.email === email)) return send(response, 409, { error: 'An account with this email already exists.' })
+    const passwordSalt = randomBytes(16).toString('hex')
+    const passwordHash = (await scrypt(body.password, passwordSalt, 64)).toString('hex')
+    const user = { id: randomUUID(), name, email, role: 'user', status: 'approved', balances: { BTC: 0, ETH: 0, USDT: 0, SOL: 0 }, transactions: [], createdAt: new Date().toISOString(), passwordSalt, passwordHash }
+    database.users.push(user)
+    await persistDatabase(database)
+    return send(response, 201, { user: publicUser(user) })
+  }
+
+  if (method === 'POST' && url.pathname === '/api/auth/login') {
+    const body = await readJson(request)
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : ''
+    const user = database.users.find(account => account.email === email)
+    if (!user || typeof body.password !== 'string') return send(response, 401, { error: 'Invalid email or password.' })
+    const candidate = await scrypt(body.password, user.passwordSalt, 64)
+    if (!timingSafeEqual(candidate, Buffer.from(user.passwordHash, 'hex'))) return send(response, 401, { error: 'Invalid email or password.' })
+    if (user.status === 'banned') return send(response, 403, { error: 'Your account has been banned. Please contact support for assistance.' })
+    if (user.status === 'suspended') return send(response, 403, { error: 'Your account is suspended. Please contact support for assistance.' })
+    if (user.status === 'rejected') return send(response, 403, { error: 'Your account application was rejected. Please contact support for assistance.' })
+    const token = signJwt(user)
+    return send(response, 200, { token, expiresIn: sessionLifetimeSeconds, user: publicUser(user) })
+  }
+
+  const userId = authenticate(request)
+  if (!userId) return send(response, 401, { error: 'Authentication required.' })
+  const user = database.users.find(account => account.id === userId)
+  if (!user) return send(response, 401, { error: 'Account no longer exists.' })
+  if (user.role !== 'admin' && user.status === 'banned') return send(response, 403, { error: 'Your account has been banned. Please contact support for assistance.' })
+  if (user.role !== 'admin' && user.status === 'rejected') return send(response, 403, { error: 'Your account application was rejected. Please contact support for assistance.' })
+  if (user.role !== 'admin' && user.status === 'suspended') return send(response, 403, { error: 'Your account is suspended. Please contact support for assistance.' })
+
+  if (method === 'GET' && url.pathname === '/api/auth/me') return send(response, 200, { user: publicUser(user) })
+  if (method === 'GET' && url.pathname === '/api/investments') {
+    const investments = (user.investments || []).map(investment => investmentSnapshot(investment)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    return send(response, 200, { investments })
+  }
+  if (method === 'POST' && url.pathname === '/api/investments') {
+    const body = await readJson(request)
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return send(response, 400, { error: 'Provide investment details as a JSON object.' })
+    const ticker = typeof body.ticker === 'string' ? body.ticker.trim().toUpperCase() : ''
+    const amount = Number(body.amount)
+    const roundedAmount = Math.round(amount * 1e8) / 1e8
+    if (!Object.hasOwn(depositNetworks, ticker) || !Number.isFinite(amount) || amount < 0.00000001 || roundedAmount !== amount) {
+      return send(response, 400, { error: 'Provide a supported asset and an amount of at least 0.00000001 with no more than 8 decimal places.' })
+    }
+    user.balances ||= {}
+    if ((Number(user.balances[ticker]) || 0) < amount) return send(response, 409, { error: 'Insufficient balance for this investment.' })
+    const createdAt = new Date().toISOString()
+    const investment = { id: randomUUID(), ticker, principal: amount, status: 'active', createdAt }
+    const activity = { id: randomUUID(), title: 'Simulated investment started', ticker, amount, type: 'sold', status: 'Completed', createdAt }
+    user.balances[ticker] -= amount
+    user.investments ||= []
+    user.investments.unshift(investment)
+    user.transactions ||= []
+    user.transactions.push(activity)
+    await persistDatabase(database)
+    return send(response, 201, { investment: investmentSnapshot(investment), activity, user: publicUser(user) })
+  }
+  const investmentRedeemMatch = url.pathname.match(/^\/api\/investments\/([^/]+)\/redeem$/)
+  if (method === 'POST' && investmentRedeemMatch) {
+    const investment = (user.investments || []).find(item => item.id === investmentRedeemMatch[1])
+    if (!investment) return send(response, 404, { error: 'Investment not found.' })
+    if (investment.status !== 'active') return send(response, 409, { error: 'This simulated investment has already been redeemed.' })
+    const now = Date.now()
+    const snapshot = investmentSnapshot(investment, now)
+    if (!snapshot.canRedeem) return send(response, 409, { error: `This investment is locked until ${snapshot.maturesAt}.` })
+    investment.status = 'closed'
+    investment.closedAt = new Date(now).toISOString()
+    investment.completedPeriods = snapshot.completedPeriods
+    investment.returnedAmount = snapshot.currentValue
+    user.balances ||= {}
+    user.balances[investment.ticker] = (Number(user.balances[investment.ticker]) || 0) + snapshot.currentValue
+    user.transactions ||= []
+    const activity = {
+      id: randomUUID(),
+      title: 'Simulated investment redeemed',
+      ticker: investment.ticker,
+      amount: snapshot.currentValue,
+      type: 'received',
+      status: 'Completed',
+      createdAt: investment.closedAt,
+    }
+    user.transactions.push(activity)
+    await persistDatabase(database)
+    return send(response, 200, { investment: investmentSnapshot(investment, now), activity, user: publicUser(user) })
+  }
+  if (method === 'GET' && url.pathname === '/api/alerts') {
+    const storedUser = await usersCollection.findOne({ id: user.id }, { projection: { alerts: 1, _id: 0 } })
+    return send(response, 200, { alerts: storedUser?.alerts || [] })
+  }
+  if (method === 'PATCH' && url.pathname === '/api/auth/me') {
+    const body = await readJson(request)
+    if (Object.hasOwn(body, 'currency') && !['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'INR'].includes(body.currency)) return send(response, 400, { error: 'Choose a supported display currency.' })
+    const allowedFields = ['pinHash', 'connectedWalletAddress', 'connectedWalletNetwork', 'currency']
+    for (const field of allowedFields) if (Object.hasOwn(body, field)) user[field] = body[field]
+    await persistDatabase(database)
+    return send(response, 200, { user: publicUser(user) })
+  }
+  if (method === 'POST' && url.pathname === '/api/auth/logout') {
+    const token = request.headers.authorization.match(/^Bearer\s+(.+)$/i)[1]
+    if (token) revokedTokens.add(token)
+    return send(response, 200, { status: 'signed_out' })
+  }
+  if (url.pathname.startsWith('/api/admin/')) {
+    if (user.role !== 'admin') return send(response, 403, { error: 'Administrator access required.' })
+    if (url.pathname === '/api/admin/deposit-addresses') {
+      if (method === 'GET') return send(response, 200, { depositAddresses: sharedDepositAddresses })
+      if (method === 'PATCH') {
+        const body = await readJson(request)
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(field => field !== 'depositAddresses')) {
+          return send(response, 400, { error: 'Provide only a depositAddresses setting.' })
+        }
+        const validationError = validateDepositAddresses(body.depositAddresses)
+        if (validationError) return send(response, 400, { error: validationError })
+        await settingsCollection.updateOne(
+          { _id: 'shared-deposit-addresses' },
+          { $set: { value: body.depositAddresses, updatedAt: new Date().toISOString() } },
+          { upsert: true },
+        )
+        sharedDepositAddresses = body.depositAddresses
+        database.sharedDepositAddresses = sharedDepositAddresses
+        return send(response, 200, { depositAddresses: sharedDepositAddresses })
+      }
+    }
+    if (method === 'GET' && url.pathname === '/api/admin/activity') {
+      const activities = database.users.filter(account => account.role !== 'admin').flatMap(account =>
+        (account.transactions || []).map(activity => ({ ...activity, userName: account.name, userEmail: account.email }))
+      ).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      return send(response, 200, { activities })
+    }
+    if (method === 'GET' && url.pathname === '/api/admin/users') {
+      return send(response, 200, {
+        users: database.users.filter(account => account.role !== 'admin').map(publicUser),
+        depositAddresses: sharedDepositAddresses,
+      })
+    }
+    if (method === 'GET' && url.pathname === '/api/admin/alerts') {
+      const alerts = database.users.filter(account => account.role !== 'admin').flatMap(account =>
+        (account.alerts || []).map(alert => ({ ...alert, userId: account.id, userName: account.name, userEmail: account.email }))
+      ).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+      return send(response, 200, { alerts })
+    }
+    const alertMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/alerts$/)
+    if (method === 'POST' && alertMatch) {
+      const target = database.users.find(account => account.id === alertMatch[1] && account.role !== 'admin')
+      if (!target) return send(response, 404, { error: 'User not found.' })
+      const body = await readJson(request)
+      const title = typeof body.title === 'string' ? body.title.trim() : ''
+      const message = typeof body.message === 'string' ? body.message.replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim() : ''
+      if (!title || title.length > 120 || !message || message.length > 1000) return send(response, 400, { error: 'Provide a title (up to 120 characters) and message (up to 1000 characters).' })
+      const alert = { id: randomUUID(), title, message, createdAt: new Date().toISOString(), read: false }
+      const saved = await usersCollection.updateOne({ id: target.id }, { $push: { alerts: { $each: [alert], $position: 0 } } })
+      if (!saved.matchedCount) return send(response, 404, { error: 'User was not found in MongoDB.' })
+      target.alerts ||= []
+      target.alerts.unshift(alert)
+      return send(response, 201, { alert })
+    }
+    const alertItemMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/alerts\/([^/]+)$/)
+    if (alertItemMatch && (method === 'PATCH' || method === 'DELETE')) {
+      const target = database.users.find(account => account.id === alertItemMatch[1] && account.role !== 'admin')
+      if (!target) return send(response, 404, { error: 'User not found.' })
+      target.alerts ||= []
+      const alertIndex = target.alerts.findIndex(alert => alert.id === alertItemMatch[2])
+      if (alertIndex < 0) return send(response, 404, { error: 'Alert not found.' })
+      if (method === 'DELETE') {
+        const deleted = await usersCollection.updateOne(
+          { id: target.id, 'alerts.id': target.alerts[alertIndex].id },
+          { $pull: { alerts: { id: target.alerts[alertIndex].id } } }
+        )
+        if (!deleted.matchedCount) return send(response, 404, { error: 'Alert was not found in MongoDB.' })
+        target.alerts.splice(alertIndex, 1)
+      } else {
+        const body = await readJson(request)
+        const title = typeof body.title === 'string' ? body.title.trim() : ''
+        const message = typeof body.message === 'string' ? body.message.replace(/\\n/g, ' ').replace(/\s+/g, ' ').trim() : ''
+        if (!title || title.length > 120 || !message || message.length > 1000) return send(response, 400, { error: 'Provide a title (up to 120 characters) and message (up to 1000 characters).' })
+        target.alerts[alertIndex] = { ...target.alerts[alertIndex], title, message, updatedAt: new Date().toISOString() }
+        const updated = await usersCollection.updateOne({ id: target.id }, { $set: { alerts: target.alerts } })
+        if (!updated.matchedCount) return send(response, 404, { error: 'User was not found in MongoDB.' })
+      }
+      return send(response, 200, { alerts: target.alerts })
+    }
+    const match = url.pathname.match(/^\/api\/admin\/users\/([^/]+)$/)
+    if (method === 'DELETE' && match) {
+      const targetIndex = database.users.findIndex(account => account.id === match[1] && account.role !== 'admin')
+      if (targetIndex < 0) return send(response, 404, { error: 'User not found.' })
+      const target = database.users[targetIndex]
+      const deleted = await usersCollection.deleteOne({ id: target.id })
+      if (!deleted.deletedCount) return send(response, 404, { error: 'User was not found in MongoDB.' })
+      database.users.splice(targetIndex, 1)
+      return send(response, 200, { deleted: true, userId: target.id })
+    }
+    if (method === 'PATCH' && match) {
+      const target = database.users.find(account => account.id === match[1] && account.role !== 'admin')
+      if (!target) return send(response, 404, { error: 'User not found.' })
+      const body = await readJson(request)
+      const allowedFields = ['status', 'depositAddress', 'depositAsset', 'network', 'depositAddresses', 'fee', 'feeTitle', 'feeDescription', 'feeStatus']
+      if (Object.keys(body).some(field => !allowedFields.includes(field))) return send(response, 400, { error: 'Unsupported account setting.' })
+      if (Object.hasOwn(body, 'status') && !['approved', 'pending', 'rejected', 'banned', 'suspended'].includes(body.status)) return send(response, 400, { error: 'Status must be approved, pending, rejected, or banned.' })
+      if (Object.hasOwn(body, 'depositAddresses')) {
+        const validationError = validateDepositAddresses(body.depositAddresses)
+        if (validationError) return send(response, 400, { error: validationError })
+      }
+      Object.assign(target, body)
+      await persistDatabase(database)
+      return send(response, 200, { user: publicUser(target) })
+    }
+    const creditMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/credit$/)
+    if (method === 'POST' && creditMatch) {
+      const target = database.users.find(account => account.id === creditMatch[1] && account.role !== 'admin')
+      if (!target) return send(response, 404, { error: 'User not found.' })
+      const body = await readJson(request)
+      const ticker = typeof body.ticker === 'string' ? body.ticker.toUpperCase() : ''
+      const amount = Number(body.amount)
+      if (!/^[A-Z0-9]{2,12}$/.test(ticker) || !Number.isFinite(amount) || amount <= 0) return send(response, 400, { error: 'Provide a valid ticker and positive amount.' })
+      const activity = { id: randomUUID(), title: `Received ${ticker}`, ticker, amount, type: 'received', status: 'Completed', createdAt: new Date().toISOString() }
+      target.balances ||= {}
+      target.transactions ||= []
+      target.balances[ticker] = (target.balances[ticker] || 0) + amount
+      target.transactions.push(activity)
+      await persistDatabase(database)
+      return send(response, 201, { user: publicUser(target), activity })
+    }
+  }
+  if (method === 'GET' && url.pathname === '/api/activity') return send(response, 200, { activities: [...user.transactions].sort((a, b) => b.createdAt.localeCompare(a.createdAt)) })
+  if (method === 'POST' && url.pathname === '/api/activity') {
+    const body = await readJson(request)
+    const title = typeof body.title === 'string' ? body.title.trim() : ''
+    const ticker = typeof body.ticker === 'string' ? body.ticker.trim().toUpperCase() : ''
+    const amount = Number(body.amount)
+    const type = body.type
+    if (!title || title.length > 120 || !/^[A-Z0-9]{2,12}$/.test(ticker) || !Number.isFinite(amount) || amount <= 0 || !['sent', 'received', 'bought', 'sold'].includes(type)) return send(response, 400, { error: 'Provide a title, valid ticker, positive amount, and supported activity type.' })
+    if (type === 'sent' || type === 'sold') {
+      if ((user.balances[ticker] || 0) < amount) return send(response, 409, { error: 'Insufficient balance.' })
+    }
+    const activity = { id: randomUUID(), title, ticker, amount, type, status: 'Completed', createdAt: new Date().toISOString() }
+    user.transactions.push(activity)
+    if (type === 'received' || type === 'bought') user.balances[ticker] = (user.balances[ticker] || 0) + amount
+    if (type === 'sent' || type === 'sold') user.balances[ticker] -= amount
+    await persistDatabase(database)
+    return send(response, 201, { activity })
+  }
+  return send(response, 404, { error: 'Route not found.' })
+}
+
+const server = createServer((request, response) => {
+  const origin = request.headers.origin
+  if (origin === allowedOrigin) {
+    response.setHeader('Access-Control-Allow-Origin', allowedOrigin)
+    response.setHeader('Vary', 'Origin')
+    response.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+    response.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS')
+  }
+  if (request.method === 'OPTIONS') { response.writeHead(204); return response.end() }
+  route(request, response).catch(error => {
+    if (response.headersSent) return response.destroy(error)
+    send(response, error.status || 500, { error: error.status ? error.message : 'Internal server error.' })
+    if (!error.status) console.error(error)
+  })
+})
+
+const port = Number(process.env.PORT) || 4000
+server.listen(port, () => console.log(`PrimeVest API listening on http://localhost:${port}`))
