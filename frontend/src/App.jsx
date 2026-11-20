@@ -583,7 +583,6 @@ function PortfolioPage({ user, investments, token, prices, currency, loadingPric
   return <div className="page-content">
     <div className="page-title-row wallet-page-heading"><div><div className="eyebrow page-eyebrow">YOUR WALLET</div><h1>Wallet</h1><p className="muted">Manage balances, receive addresses, and outgoing activity.</p></div><WalletActions onSend={() => onWalletAction('send')} onReceive={() => onWalletAction('receive')} onWithdraw={() => onWalletAction('withdraw')} /></div>
     <section className="wallet-total-panel"><div><span className="balance-label">ESTIMATED TOTAL BALANCE</span><strong>{COINS.some(item => coinPrice(prices, item.ticker, currency)) ? money(total, currency) : '—'}</strong><small>Includes active simulated positions; based on current public market prices</small></div><div className="wallet-total-icon"><Wallet size={23} /></div></section>
-    <div className="wallet-backend-note"><CircleHelp size={15} /><span>Send and withdraw actions update your account ledger only; this backend does not execute blockchain transactions. Deposits are not automatically detected.</span></div>
     <AssetCards balances={user.balances || {}} prices={prices} currency={currency} />
     <MarketTracker balances={user.balances || {}} prices={prices} currency={currency} loading={loadingPrices} />
     <InvestmentManager user={user} investments={investments} token={token} prices={prices} currency={currency} busy={investmentBusy} error={investmentError} onInvest={onInvest} onRedeem={onRedeem} onInvestmentsRefreshed={onInvestmentsRefreshed} />
